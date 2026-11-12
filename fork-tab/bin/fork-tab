@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Usage: fork-tab <session-id> <working-dir> [t|d|w]
+#   t (default) -> new Ghostty tab
+#   d           -> new Ghostty split (to the right)
+#   w           -> new Ghostty window
+# Opens a forked copy of the given Claude session.
+#
+# Uses Ghostty's own AppleScript dictionary (Ghostty 1.3+), not System Events
+# keystrokes, so Ghostty needs no Accessibility permission. Nothing is typed
+# into a focused window.
+set -euo pipefail
+
+session_id="${1:?missing session id}"
+work_dir="${2:?missing working dir}"
+mode="${3:-t}"
+
+case "$mode" in
+  t) where="tab" ;;
+  d) where="split" ;;
+  w) where="window" ;;
+  *) echo "fork-tab: unknown mode '$mode' (use t, d or w)" >&2; exit 1 ;;
+esac
+
+# Find the tty of the Claude session that called us by walking up the process
+# tree, so the tab/split lands next to that terminal rather than whichever
+# Ghostty window happens to be frontmost. Empty if none is found.
+my_tty=""
+pid=$$
+while [ "${pid:-1}" -gt 1 ]; do
+  t=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [ -n "$t" ] && [ "$t" != "??" ]; then my_tty="/dev/$t"; break; fi
+  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+done
+
+# Ghostty runs AppleScript commands with a bare system PATH
+# (/usr/bin:/bin:...), so use claude's absolute path and hand the new
+# terminal this session's PATH.
+claude_bin=$(command -v claude) || { echo "fork-tab: claude not found on PATH" >&2; exit 1; }
+# Let Claude build the fork itself. This copies the whole conversation
+# (including this /fork-tab turn) and never touches the original session.
+cmd="$(printf %q "$claude_bin") --resume $session_id --fork-session"
+
+# Values are passed via argv, not interpolated into the AppleScript source,
+# so quotes/spaces in paths can't break the script.
+osascript - "$work_dir" "$cmd" "$mode" "$my_tty" "PATH=$PATH" <<'APPLESCRIPT' >/dev/null
+on run argv
+  set theDir to item 1 of argv
+  set theCmd to item 2 of argv
+  set theMode to item 3 of argv
+  set theTty to item 4 of argv
+  set thePath to item 5 of argv
+
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set initial working directory of cfg to theDir
+    set command of cfg to theCmd
+    set environment variables of cfg to {thePath}
+
+    if theMode is "w" then
+      new window with configuration cfg
+      return
+    end if
+
+    -- Locate the terminal running the calling session; fall back to front window.
+    set homeWin to front window
+    set homeTerm to focused terminal of selected tab of homeWin
+    if theTty is not "" then
+      repeat with w in windows
+        repeat with tb in tabs of w
+          repeat with tm in terminals of tb
+            if tty of tm is theTty then
+              set homeWin to contents of w
+              set homeTerm to contents of tm
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end if
+
+    if theMode is "d" then
+      split homeTerm direction right with configuration cfg
+    else
+      new tab in homeWin with configuration cfg
+    end if
+  end tell
+end run
+APPLESCRIPT
+
+echo "Forked session $session_id into a new Ghostty $where."
